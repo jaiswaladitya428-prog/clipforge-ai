@@ -41,6 +41,9 @@ import {
   Type,
   Sliders,
   Check,
+  Youtube,
+  Play,
+  Download,
 } from "lucide-react";
 
 export default function ProjectWorkspacePage() {
@@ -109,7 +112,7 @@ export default function ProjectWorkspacePage() {
 
       // Initialize default trim range once project duration is known
       if (proj.video?.duration && proj.video.duration > 0) {
-        setTrimEnd((prev) => (prev === 30 ? Math.min(35, proj.video!.duration!) : prev));
+        setTrimEnd((prev) => (prev === 30 ? proj.video!.duration! : prev));
       }
 
       return proj;
@@ -204,6 +207,7 @@ export default function ProjectWorkspacePage() {
   const applyHighlight = (h: ViralHighlight) => {
     setTrimStart(h.start_time);
     setTrimEnd(h.end_time);
+    setAspectRatio("9:16");
     if (h.suggested_theme && ["minimal", "blueprint", "anime", "ghibli", "papercut"].includes(h.suggested_theme)) {
       setTheme(h.suggested_theme as any);
     }
@@ -211,6 +215,38 @@ export default function ProjectWorkspacePage() {
       setCaptionStyle(h.suggested_caption_style as any);
     }
     setSeekTime(h.start_time);
+  };
+
+  const handleRenderSpecificHighlight = async (h: ViralHighlight) => {
+    applyHighlight(h);
+    setShowRenderModal(true);
+    setRendering(true);
+    try {
+      const payload: RenderRequest = {
+        start_time: h.start_time,
+        end_time: h.end_time,
+        aspect_ratio: "9:16",
+        theme: (h.suggested_theme as any) || "anime",
+        caption_style: (h.suggested_caption_style as any) || "karaoke",
+        captions: captions.filter((c) => c.start < h.end_time && c.end > h.start_time),
+      };
+
+      const job = await apiFetch<RenderJobResponse>(`/projects/${id}/render`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      setRenderJob(job);
+      pollRenderStatus(job.render_id);
+    } catch (err: any) {
+      setRenderJob({
+        render_id: "",
+        status: "failed",
+        progress: 0,
+        error: err.message || "Failed to render short.",
+      });
+      setRendering(false);
+    }
   };
 
   const handleUpdateCaption = (idx: number, newText: string) => {
@@ -315,6 +351,8 @@ export default function ProjectWorkspacePage() {
                 className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${
                   project.status === "completed"
                     ? "bg-emerald-950/60 text-emerald-300 border border-emerald-800"
+                    : project.status === "downloading"
+                    ? "bg-red-950/60 text-red-300 border border-red-800 animate-pulse"
                     : project.status === "processing"
                     ? "bg-amber-950/60 text-amber-300 border border-amber-800 animate-pulse"
                     : project.status === "failed"
@@ -368,7 +406,26 @@ export default function ProjectWorkspacePage() {
         </div>
       )}
 
-      {/* Case 2: Processing in progress */}
+      {/* Case 2A: Downloading YouTube Video */}
+      {project.status === "downloading" && (
+        <div className="text-center py-20 px-4 rounded-2xl border border-red-900/40 bg-card/40 space-y-4 max-w-lg mx-auto shadow-sm">
+          <div className="p-4 rounded-full bg-red-600/10 text-red-500 w-fit mx-auto animate-pulse border border-red-500/20">
+            <Youtube className="w-8 h-8 fill-current" />
+          </div>
+          <div className="space-y-1">
+            <h2 className="text-lg font-semibold text-foreground">Downloading YouTube Stream & Audio</h2>
+            <p className="text-xs text-muted-foreground">
+              yt-dlp is downloading the video and merging high-fidelity audio with local FFmpeg. Speech transcription will start automatically once finished.
+            </p>
+          </div>
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-600/10 text-red-400 text-xs font-medium">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Downloading & Muxing stream...
+          </div>
+        </div>
+      )}
+
+      {/* Case 2B: Processing in progress */}
       {project.status === "processing" && (
         <div className="text-center py-20 px-4 rounded-xl border border-border bg-card/40 space-y-4 max-w-lg mx-auto">
           <div className="p-4 rounded-full bg-primary/10 text-primary w-fit mx-auto animate-spin">
@@ -421,13 +478,13 @@ export default function ProjectWorkspacePage() {
                 </div>
                 <div>
                   <h2 className="text-sm font-bold text-foreground flex items-center gap-1.5">
-                    AI Viral Scene Extractor
-                    <span className="text-[10px] font-normal px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
-                      Gemini Powered
+                    AI 30s Sliding Window Viral Shorts
+                    <span className="text-[10px] font-normal px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20">
+                      Score &gt; 95 Filter
                     </span>
                   </h2>
                   <p className="text-xs text-muted-foreground">
-                    Analyzes speech transcript to pick the top 30-60s retention hooks (no visual scene detection).
+                    Scans 30-second sliding windows as the video progresses and surfaces only high-momentum moments scoring &gt; 95.
                   </p>
                 </div>
               </div>
@@ -440,12 +497,12 @@ export default function ProjectWorkspacePage() {
                 {loadingHighlights ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Analyzing Hook Potential...
+                    Extracting Viral Highlights...
                   </>
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4" />
-                    {highlights.length > 0 ? "Re-scan Viral Hooks" : "Find Viral Hooks"}
+                    {highlights.length > 0 ? "Re-scan Highlights" : "Generate Viral Highlights"}
                   </>
                 )}
               </button>
@@ -457,45 +514,60 @@ export default function ProjectWorkspacePage() {
               </div>
             )}
 
-            {/* Render Highlight Cards if found */}
+            {/* Render 30s Viral Shorts Cards */}
             {highlights.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-2">
                 {highlights.map((h, i) => {
                   const isCurrent = trimStart === h.start_time && trimEnd === h.end_time;
                   return (
                     <div
                       key={i}
-                      className={`p-3 rounded-xl border transition-all text-xs flex flex-col justify-between space-y-2 ${
+                      className={`p-3.5 rounded-2xl border transition-all text-xs flex flex-col justify-between space-y-3 ${
                         isCurrent
-                          ? "border-amber-500 bg-amber-500/10 shadow-sm"
-                          : "border-border bg-card/40 hover:bg-card"
+                          ? "border-amber-500 bg-amber-500/10 shadow-md ring-1 ring-amber-500/30"
+                          : "border-border bg-card/50 hover:bg-card"
                       }`}
                     >
-                      <div className="space-y-1">
+                      <div className="space-y-1.5">
                         <div className="flex items-center justify-between">
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 font-bold text-[10px]">
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-bold text-[10px] ${
+                            h.viral_score >= 95
+                              ? "bg-red-500/20 text-red-400 border border-red-500/30"
+                              : "bg-amber-500/20 text-amber-400"
+                          }`}>
                             <Flame className="w-3 h-3 fill-current" />
-                            {h.viral_score}% Score
+                            {h.viral_score >= 95 ? `🔥 ${h.viral_score}% Viral (>95)` : `${h.viral_score}% Retention`}
                           </span>
-                          <span className="font-mono text-muted-foreground text-[10px]">
-                            {(h.end_time - h.start_time).toFixed(1)}s
+                          <span className="font-mono text-muted-foreground text-[10px] bg-secondary/50 px-2 py-0.5 rounded">
+                            Short #{i + 1} • {(h.end_time - h.start_time).toFixed(1)}s
                           </span>
                         </div>
                         <h4 className="font-bold text-foreground text-xs line-clamp-1">{h.hook_title}</h4>
                         <p className="text-muted-foreground text-[11px] line-clamp-2">{h.reasoning}</p>
                       </div>
 
-                      <button
-                        onClick={() => applyHighlight(h)}
-                        className={`w-full py-1.5 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
-                          isCurrent
-                            ? "bg-amber-500 text-black font-bold"
-                            : "bg-secondary text-foreground hover:bg-secondary/80"
-                        }`}
-                      >
-                        {isCurrent ? <Check className="w-3.5 h-3.5" /> : <Scissors className="w-3.5 h-3.5" />}
-                        {isCurrent ? "Applied to Cut" : "Apply to Studio"}
-                      </button>
+                      <div className="flex items-center gap-2 pt-1 border-t border-border/60">
+                        <button
+                          onClick={() => applyHighlight(h)}
+                          className={`flex-1 py-1.5 px-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+                            isCurrent
+                              ? "bg-amber-500 text-black font-bold"
+                              : "bg-secondary text-foreground hover:bg-secondary/80"
+                          }`}
+                        >
+                          {isCurrent ? <Check className="w-3.5 h-3.5" /> : <Play className="w-3 h-3 fill-current" />}
+                          <span>{isCurrent ? "Previewing" : "Preview 9:16"}</span>
+                        </button>
+
+                        <button
+                          onClick={() => handleRenderSpecificHighlight(h)}
+                          className="py-1.5 px-3 rounded-xl bg-primary text-primary-foreground font-semibold text-xs flex items-center justify-center gap-1 hover:opacity-90 transition-opacity shadow-sm"
+                          title="Quick Render this Highlight"
+                        >
+                          <Film className="w-3.5 h-3.5" />
+                          <span>Export</span>
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
@@ -652,7 +724,7 @@ export default function ProjectWorkspacePage() {
                       <input
                         type="range"
                         min={0}
-                        max={Math.max(0, trimEnd - 5)}
+                        max={Math.max(0, trimEnd - 0.5)}
                         step={0.5}
                         value={trimStart}
                         onChange={(e) => {
@@ -672,7 +744,7 @@ export default function ProjectWorkspacePage() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => setTrimStart((p) => Math.min(trimEnd - 5, p + 1))}
+                          onClick={() => setTrimStart((p) => Math.min(Math.max(0, trimEnd - 0.5), p + 1))}
                           className="flex-1 py-0.5 rounded bg-card border border-border text-[10px] hover:bg-muted"
                         >
                           +1s
@@ -688,7 +760,7 @@ export default function ProjectWorkspacePage() {
                       </div>
                       <input
                         type="range"
-                        min={trimStart + 5}
+                        min={Math.min(maxVideoDuration, trimStart + 0.5)}
                         max={maxVideoDuration}
                         step={0.5}
                         value={trimEnd}
@@ -698,7 +770,7 @@ export default function ProjectWorkspacePage() {
                       <div className="flex gap-1.5">
                         <button
                           type="button"
-                          onClick={() => setTrimEnd((p) => Math.max(trimStart + 5, p - 1))}
+                          onClick={() => setTrimEnd((p) => Math.max(trimStart + 0.5, p - 1))}
                           className="flex-1 py-0.5 rounded bg-card border border-border text-[10px] hover:bg-muted"
                         >
                           -1s

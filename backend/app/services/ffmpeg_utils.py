@@ -1,15 +1,37 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
 def get_ffmpeg_binary() -> str:
-    """Return path to ffmpeg executable, preferring imageio-ffmpeg for reliability on Windows."""
+    """
+    Return path to ffmpeg executable, preferring imageio-ffmpeg for reliability on Windows.
+    Ensures a standardized 'ffmpeg.exe' binary exists and is available on os.environ['PATH'].
+    """
     try:
         import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and Path(exe).exists():
-            return exe
+        raw_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if raw_exe and Path(raw_exe).exists():
+            raw_path = Path(raw_exe)
+            bin_dir = raw_path.parent
+            std_exe = bin_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            if not std_exe.exists():
+                try:
+                    os.link(str(raw_path), str(std_exe))
+                except Exception:
+                    try:
+                        shutil.copy2(str(raw_path), str(std_exe))
+                    except Exception:
+                        pass
+            
+            final_exe = str(std_exe) if std_exe.exists() else str(raw_path)
+            
+            # Ensure bin_dir is in os.environ['PATH'] so yt-dlp & child processes find it automatically
+            if str(bin_dir) not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+                
+            return final_exe
     except ImportError:
         pass
     

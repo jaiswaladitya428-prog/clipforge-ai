@@ -13,7 +13,7 @@ def detect_scenes(video_path: Path, video_duration: float = 0.0, threshold: floa
     cmd = [
         ffmpeg_exe,
         "-i", str(video_path),
-        "-filter:v", f"select='gt(scene,{threshold})',showinfo",
+        "-filter:v", f"scale=320:-1,select='gt(scene,{threshold})',showinfo",
         "-f", "null",
         "-"
     ]

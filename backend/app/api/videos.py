@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -20,6 +21,7 @@ from ..schemas.render import (
     RenderRequest,
     RenderJobResponse
 )
+from ..schemas.youtube import YouTubeImportRequest
 from ..services.ffmpeg_utils import extract_video_metadata
 from ..services.audio_extractor import extract_audio_wav
 from ..services.silence_detector import detect_silence
@@ -29,7 +31,10 @@ from ..services.transcriber import transcribe_audio_file
 from ..services.gemini_service import extract_viral_highlights
 from ..services.subtitle_generator import generate_ass_subtitle_file
 from ..services.video_renderer import render_styled_video
+from ..services.youtube_downloader import validate_youtube_url, download_youtube_video
 from .auth import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["Videos & Processing"])
 
@@ -39,7 +44,25 @@ ALLOWED_MIME_TYPES = {
     "video/webm",
     "video/x-matroska", # .mkv
 }
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB limit
+def dispatch_video_analysis(project_id: str, video_path: Path, background_tasks: BackgroundTasks):
+    """Dispatch video analysis to Celery worker, falling back to BackgroundTasks if offline."""
+    try:
+        from ..workers.tasks import analyze_video_task
+        analyze_video_task.delay(project_id, str(video_path))
+        logger.info(f"Dispatched project {project_id} analysis to Celery worker.")
+    except Exception as e:
+        logger.warning(f"Celery dispatch failed ({e}), falling back to in-process background task.")
+        background_tasks.add_task(process_video_pipeline, project_id, video_path)
+
+def dispatch_youtube_ingest(project_id: str, youtube_url: str, background_tasks: BackgroundTasks):
+    """Dispatch YouTube ingestion to Celery worker, falling back to BackgroundTasks if offline."""
+    try:
+        from ..workers.tasks import ingest_youtube_task
+        ingest_youtube_task.delay(project_id, youtube_url)
+        logger.info(f"Dispatched YouTube ingest for project {project_id} to Celery worker.")
+    except Exception as e:
+        logger.warning(f"Celery dispatch failed ({e}), falling back to in-process background task.")
+        background_tasks.add_task(process_youtube_ingest_pipeline, project_id, youtube_url)
 
 def process_video_pipeline(project_id: str, video_path: Path):
     """Background worker pipeline: Audio extraction, silence detection, scene detection, keyframes, and Whisper transcription."""
@@ -125,6 +148,96 @@ def process_video_pipeline(project_id: str, video_path: Path):
     finally:
         db.close()
 
+def process_youtube_ingest_pipeline(project_id: str, youtube_url: str):
+    """Background worker to download YouTube video/live stream and trigger transcription pipeline."""
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        project.status = "downloading"
+        db.commit()
+
+        saved_filename = f"{project_id}.mp4"
+        saved_path = settings.VIDEOS_DIR / saved_filename
+
+        # Download and mux best video + audio locally
+        info = download_youtube_video(youtube_url, saved_path)
+
+        duration, width, height = extract_video_metadata(saved_path)
+
+        source_video = db.query(SourceVideo).filter(SourceVideo.project_id == project.id).first()
+        if not source_video:
+            source_video = SourceVideo(project_id=project.id)
+            db.add(source_video)
+
+        source_video.file_path = str(saved_path)
+        source_video.file_name = f"{info.get('title', 'YouTube Video')[:100]}.mp4"
+        source_video.file_size = info.get("file_size") or (saved_path.stat().st_size if saved_path.exists() else 0)
+        source_video.duration = duration or info.get("duration")
+        source_video.width = width
+        source_video.height = height
+        source_video.mime_type = "video/mp4"
+
+        # Update project title if still default
+        if project.title.startswith("Untitled") or project.title.lower() == "new project":
+            project.title = info.get("title", project.title)[:190]
+
+        project.status = "processing"
+        db.commit()
+
+        # Run standard Whisper & Audio pipeline
+        process_video_pipeline(project_id, saved_path)
+
+    except Exception as e:
+        db.rollback()
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project:
+            project.status = "failed"
+            analysis = db.query(VideoAnalysis).filter(VideoAnalysis.project_id == project_id).first()
+            if not analysis:
+                analysis = VideoAnalysis(project_id=project_id)
+                db.add(analysis)
+            analysis.status = "failed"
+            analysis.error_message = f"YouTube download error: {str(e)}"
+            db.commit()
+    finally:
+        db.close()
+
+@router.post("/{project_id}/youtube", response_model=ProjectResponse)
+def import_from_youtube(
+    project_id: str,
+    request: YouTubeImportRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Import video from YouTube URL (standard video or live stream)."""
+    project = (
+        db.query(Project)
+        .filter(Project.id == project_id, Project.user_id == current_user.id)
+        .first()
+    )
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": {"code": "PROJECT_NOT_FOUND", "message": "Project not found"}}
+        )
+
+    if not validate_youtube_url(request.url):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": {"code": "INVALID_YOUTUBE_URL", "message": "Please provide a valid YouTube video or live stream link."}}
+        )
+
+    project.status = "downloading"
+    db.commit()
+    db.refresh(project)
+
+    dispatch_youtube_ingest(project.id, request.url, background_tasks)
+    return project
+
 @router.post("/{project_id}/upload", response_model=ProjectResponse)
 async def upload_video(
     project_id: str,
@@ -159,12 +272,6 @@ async def upload_video(
     with open(saved_path, "wb") as buffer:
         while chunk := await file.read(1024 * 1024):
             total_bytes += len(chunk)
-            if total_bytes > MAX_FILE_SIZE:
-                saved_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail={"error": {"code": "FILE_TOO_LARGE", "message": "File exceeds 500 MB limit."}}
-                )
             buffer.write(chunk)
 
     duration, width, height = extract_video_metadata(saved_path)
@@ -186,7 +293,7 @@ async def upload_video(
     db.commit()
     db.refresh(project)
 
-    background_tasks.add_task(process_video_pipeline, project.id, saved_path)
+    dispatch_video_analysis(project.id, saved_path, background_tasks)
     return project
 
 @router.post("/{project_id}/retry", response_model=ProjectResponse)
@@ -219,7 +326,7 @@ def retry_analysis(
     db.commit()
     db.refresh(project)
 
-    background_tasks.add_task(process_video_pipeline, project.id, video_path)
+    dispatch_video_analysis(project.id, video_path, background_tasks)
     return project
 
 @router.get("/{project_id}/analysis", response_model=VideoAnalysisResponse)

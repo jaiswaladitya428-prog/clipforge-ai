@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     # Database: Supports SQLite by default or PostgreSQL via DATABASE_URL env var
     DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR}/clipforge.db")
     
+    # Redis / Celery broker
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    CELERY_TASK_ALWAYS_EAGER: bool = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1")
+    
     # Whisper configuration
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")

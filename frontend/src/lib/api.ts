@@ -27,7 +27,7 @@ export interface Project {
   user_id: string;
   title: string;
   description?: string;
-  status: "created" | "uploading" | "processing" | "completed" | "failed";
+  status: "created" | "downloading" | "uploading" | "processing" | "completed" | "failed";
   created_at: string;
   updated_at: string;
   video?: VideoMetadata;
@@ -173,4 +173,11 @@ export async function apiFetch<T>(
   }
 
   return data as T;
+}
+
+export async function importYouTubeVideo(projectId: string, url: string): Promise<Project> {
+  return apiFetch<Project>(`/projects/${projectId}/youtube`, {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
 }
